@@ -5,8 +5,10 @@ using System.ComponentModel;
 using System.Data;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -34,15 +36,17 @@ namespace ParquetFileViewer
             set
             {
                 this.openFileSchema = null;
+                this.SelectedFields = null;
                 this.openFilePath = value;
+                this.changeFieldsMenuStripButton.Enabled = false;
+                this.recordCountStatusBarLabel.Text = "0";
+                this.totalRowCountStatusBarLabel.Text = "0";
+                this.MainDataSource.Clear();
+                this.MainDataSource.Columns.Clear();
+
                 if (string.IsNullOrWhiteSpace(value))
                 {
                     this.Text = this.DefaultFormTitle;
-                    this.changeFieldsMenuStripButton.Enabled = false;
-                    this.recordCountStatusBarLabel.Text = "0";
-                    this.totalRowCountStatusBarLabel.Text = "0";
-                    this.MainDataSource.Clear();
-                    this.MainDataSource.Columns.Clear();
                 }
                 else
                 {
@@ -61,9 +65,9 @@ namespace ParquetFileViewer
             }
             set
             {
+                this.selectedFields = value;
                 if (value != null && value.Count > 0)
                 {
-                    this.selectedFields = value;
                     LoadFileToGridview();
                 }
             }
@@ -76,7 +80,8 @@ namespace ParquetFileViewer
             set
             {
                 this.currentOffset = value;
-                LoadFileToGridview();
+                if (this.IsAnyFileOpen)
+                    LoadFileToGridview();
             }
         }
 
@@ -87,7 +92,8 @@ namespace ParquetFileViewer
             set
             {
                 this.currentMaxRowCount = value;
-                LoadFileToGridview();
+                if (this.IsAnyFileOpen)
+                    LoadFileToGridview();
             }
         }
 
@@ -167,9 +173,7 @@ namespace ParquetFileViewer
         {
             int offset = 0;
             if (int.TryParse(((TextBox)sender).Text, out offset))
-            {
                 this.CurrentOffset = offset;
-            }
             else
                 ((TextBox)sender).Text = this.CurrentOffset.ToString();
         }
@@ -340,7 +344,7 @@ MULTIPLE CONDITIONS:
 
         private void OpenFieldSelectionDialog()
         {
-            if (!string.IsNullOrWhiteSpace(this.OpenFilePath))
+            if (!string.IsNullOrWhiteSpace(this.OpenFilePath) && !this.FileSchemaBackgroundWorker.IsBusy)
             {
                 if (this.openFileSchema == null)
                 {
@@ -356,7 +360,7 @@ MULTIPLE CONDITIONS:
         {
             try
             {
-                if (this.IsAnyFileOpen)
+                if (this.IsAnyFileOpen && !this.ReadDataBackgroundWorker.IsBusy)
                 {
                     if (File.Exists(this.OpenFilePath))
                     {
@@ -366,7 +370,7 @@ MULTIPLE CONDITIONS:
                         args.Fields = this.SelectedFields.ToArray();
 
                         this.ShowLoadingIcon("Loading Data", this.ReadDataBackgroundWorker);
-                        this.ReadDataBackgroundWorker.RunWorkerAsync(args);
+                        this.ReadDataBackgroundWorker.RunWorkerAsync();
                     }
                     else
                     {
@@ -425,7 +429,7 @@ MULTIPLE CONDITIONS:
             this.loadingPanel.Controls.Add(cancelButton);
             cancelButton.BringToFront();
 
-            System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.WaitCursor;
+            Cursor.Current = Cursors.WaitCursor;
 
             this.Controls.Add(this.loadingPanel);
 
@@ -440,13 +444,13 @@ MULTIPLE CONDITIONS:
         {
             this.mainTableLayoutPanel.Enabled = true;
             this.mainMenuStrip.Enabled = true;
-            System.Windows.Forms.Cursor.Current = System.Windows.Forms.Cursors.Default;
+            Cursor.Current = Cursors.Default;
 
             if (this.loadingPanel != null)
                 this.loadingPanel.Dispose();
         }
 
-        private void FileSchemaBackgroundWorker_DoWork(object sender, System.ComponentModel.DoWorkEventArgs e)
+        private void FileSchemaBackgroundWorker_DoWork(object sender, DoWorkEventArgs e)
         {
             var schema = (Parquet.Data.Schema)e.Argument;
             if (schema != null)
@@ -454,10 +458,13 @@ MULTIPLE CONDITIONS:
             else
             {
                 //Parquet.NET doesn't have any async methods or readers that allow sequential records reading so we need to use the ThreadPool to support cancellation.
-                var task = Task<Parquet.Data.DataSet>.Run(() =>
+                var task = Task<ParquetReader>.Run(() =>
                 {
                     //Unfortunately there's no way to quickly get the metadata from a parquet file without reading an actual data row
-                    return ParquetReader.ReadFile(this.OpenFilePath, new ParquetOptions() { TreatByteArrayAsString = true }, new ReaderOptions() { Count = 1, Offset = 0 });
+                    using (var parquetReader = ParquetReader.OpenFromFile(this.OpenFilePath, new ParquetOptions() { TreatByteArrayAsString = true }))
+                    {
+                        return parquetReader.Schema;
+                    }
                 });
 
                 while (!task.IsCompleted && !((BackgroundWorker)sender).CancellationPending)
@@ -468,11 +475,11 @@ MULTIPLE CONDITIONS:
                 e.Cancel = ((BackgroundWorker)sender).CancellationPending;
 
                 if (task.IsCompleted)
-                    e.Result = task.Result.Schema;
+                    e.Result = task.Result;
             }
         }
 
-        private void FileSchemaBackgroundWorker_RunWorkerCompleted(object sender, System.ComponentModel.RunWorkerCompletedEventArgs e)
+        private void FileSchemaBackgroundWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
         {
             this.HideLoadingIcon();
             try
@@ -490,16 +497,16 @@ MULTIPLE CONDITIONS:
                 if (e.Error == null)
                 {
                     this.openFileSchema = (Parquet.Data.Schema)e.Result;
-                    string[] fields = this.openFileSchema.FieldNames;
-                    if (fields != null && fields.Length > 0)
+                    var fields = this.openFileSchema.Fields;
+                    if (fields != null && fields.Count > 0)
                     {
                         var fieldSelectionForm = new FieldsToLoadForm(fields, UtilityMethods.GetDataTableColumns(this.MainDataSource));
-                        if (fieldSelectionForm.ShowDialog(this) == System.Windows.Forms.DialogResult.OK)
+                        if (fieldSelectionForm.ShowDialog(this) == DialogResult.OK)
                         {
                             if (fieldSelectionForm.NewSelectedFields != null && fieldSelectionForm.NewSelectedFields.Count > 0)
                                 this.SelectedFields = fieldSelectionForm.NewSelectedFields;
                             else
-                                this.SelectedFields = new List<string>(fields); //By default, show all fields
+                                this.SelectedFields = fields.Select(f => f.Name).ToList(); //By default, show all fields
                         }
                     }
                     else
@@ -521,16 +528,17 @@ MULTIPLE CONDITIONS:
 
         private void ReadDataBackgroundWorker_DoWork(object sender, DoWorkEventArgs e)
         {
-            var args = (ParquetReadArgs)e.Argument;
-
             //Parquet.NET doesn't have any async methods or readers that allow sequential records reading so we need to use the ThreadPool to support cancellation.
-            var task = Task<Parquet.Data.DataSet>.Run(() =>
+            var task = Task<ParquetReadResult>.Run(() =>
             {
                 //Unfortunately there's no way to quickly get the metadata from a parquet file without reading an actual data row
                 //BUG: Parquet.NET doesn't always respect the Count parameter, sometimes returning more than the passed value...
-                return ParquetReader.ReadFile(this.OpenFilePath,
-                            new ParquetOptions() { TreatByteArrayAsString = true },
-                            new ReaderOptions() { Count = args.Count, Offset = args.Offset, Columns = args.Fields });
+                using (var parquetReader = ParquetReader.OpenFromFile(this.OpenFilePath, new ParquetOptions() { TreatByteArrayAsString = true }))
+                {
+                    int totalRowCount = 0;
+                    DataTable result = UtilityMethods.ParquetReaderToDataTable(parquetReader, out totalRowCount, this.SelectedFields, this.CurrentOffset, this.CurrentMaxRowCount);
+                    return new ParquetReadResult(result, totalRowCount);
+                }
             });
 
             while (!task.IsCompleted && !((BackgroundWorker)sender).CancellationPending)
@@ -555,12 +563,12 @@ MULTIPLE CONDITIONS:
                         return;
                     }
 
-                    var ds = (Parquet.Data.DataSet)e.Result;
-                    this.recordCountStatusBarLabel.Text = string.Format("{0} to {1}", this.CurrentOffset, this.CurrentOffset + ds.RowCount);
-                    this.totalRowCountStatusBarLabel.Text = ds.TotalRowCount.ToString();
-                    this.actualShownRecordCountLabel.Text = ds.RowCount.ToString();
+                    var result = (ParquetReadResult)e.Result;
+                    this.recordCountStatusBarLabel.Text = string.Format("{0} to {1}", this.CurrentOffset, this.CurrentOffset + result.Result.Rows.Count);
+                    this.totalRowCountStatusBarLabel.Text = result.TotalNumberOfRecordsInFile.ToString();
+                    this.actualShownRecordCountLabel.Text = result.Result.Rows.Count.ToString();
 
-                    this.MainDataSource = UtilityMethods.ParquetDataSetToDataTable(ds);
+                    this.MainDataSource = result.Result;
                 }
                 else
                     throw e.Error;
@@ -582,11 +590,10 @@ MULTIPLE CONDITIONS:
 
         private void OpenNewFile(string filePath)
         {
-            this.OpenFilePath = null;
+            this.OpenFilePath = filePath;
             this.offsetTextBox.Text = DefaultOffset.ToString();
             this.recordCountTextBox.Text = DefaultRowCount.ToString();
 
-            this.OpenFilePath = filePath;
             this.OpenFieldSelectionDialog();
         }
 
@@ -706,9 +713,21 @@ MULTIPLE CONDITIONS:
         #region Helper Types
         private struct ParquetReadArgs
         {
-            public int Count;
-            public int Offset;
+            public long Count;
+            public long Offset;
             public string[] Fields;
+        }
+
+        private class ParquetReadResult
+        {
+            public long TotalNumberOfRecordsInFile { get; private set; }
+            public DataTable Result { get; private set; }
+
+            public ParquetReadResult(DataTable result, long totalNumberOfRecordsInFile)
+            {
+                this.TotalNumberOfRecordsInFile = totalNumberOfRecordsInFile;
+                this.Result = result;
+            }
         }
 
         private enum FileType
