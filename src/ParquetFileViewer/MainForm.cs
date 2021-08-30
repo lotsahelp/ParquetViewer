@@ -1,14 +1,16 @@
 ﻿using Parquet;
+using ParquetFileViewer.Helpers;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -22,6 +24,8 @@ namespace ParquetFileViewer
         private const int loadingPanelWidth = 200;
         private const int loadingPanelHeight = 200;
         private const string QueryUselessPartRegex = "^WHERE ";
+        private const string ISO8601DateTimeFormat = "yyyy-MM-ddTHH:mm:ss.fffZ";
+        private const string DefaultTableName = "MY_TABLE";
         private readonly string DefaultFormTitle;
 
         #region Members
@@ -39,6 +43,9 @@ namespace ParquetFileViewer
                 this.SelectedFields = null;
                 this.openFilePath = value;
                 this.changeFieldsMenuStripButton.Enabled = false;
+                this.getSQLCreateTableScriptToolStripMenuItem.Enabled = false;
+                this.saveAsToolStripMenuItem.Enabled = false;
+                this.metadataViewerToolStripMenuItem.Enabled = false;
                 this.recordCountStatusBarLabel.Text = "0";
                 this.totalRowCountStatusBarLabel.Text = "0";
                 this.MainDataSource.Clear();
@@ -52,6 +59,9 @@ namespace ParquetFileViewer
                 {
                     this.Text = string.Concat("Open File: ", value);
                     this.changeFieldsMenuStripButton.Enabled = true;
+                    this.saveAsToolStripMenuItem.Enabled = true;
+                    this.getSQLCreateTableScriptToolStripMenuItem.Enabled = true;
+                    this.metadataViewerToolStripMenuItem.Enabled = true;
                 }
             }
         }
@@ -113,6 +123,18 @@ namespace ParquetFileViewer
             {
                 this.mainDataSource = value;
                 this.mainGridView.DataSource = this.mainDataSource;
+
+                try
+                {
+                    //Format date fields
+                    string dateFormat = AppSettings.UseISODateFormat ? ISO8601DateTimeFormat : string.Empty;
+                    foreach (DataGridViewColumn column in this.mainGridView.Columns)
+                    {
+                        if (column.ValueType == typeof(DateTime))
+                            column.DefaultCellStyle.Format = dateFormat;
+                    }
+                }
+                catch { }
             }
         }
         private Panel loadingPanel = null;
@@ -129,7 +151,7 @@ namespace ParquetFileViewer
             this.OpenFilePath = null;
 
             //Set DGV to be double buffered for smoother loading and scrolling
-            if (!System.Windows.Forms.SystemInformation.TerminalServerSession)
+            if (!SystemInformation.TerminalServerSession)
             {
                 Type dgvType = this.mainGridView.GetType();
                 System.Reflection.PropertyInfo pi = dgvType.GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
@@ -150,6 +172,21 @@ namespace ParquetFileViewer
             {
                 this.OpenNewFile(this.fileToLoadOnLaunch);
             }
+
+            try
+            {
+                //Setup date format checkboxes
+                if (AppSettings.UseISODateFormat)
+                    this.iSO8601ToolStripMenuItem.Checked = true;
+                else
+                    this.defaultToolStripMenuItem.Checked = true;
+
+                if (AppSettings.ReadingEngine == ParquetEngine.Default)
+                    this.defaultParquetEngineToolStripMenuItem.Checked = true;
+                else if (AppSettings.ReadingEngine == ParquetEngine.Default_Multithreaded)
+                    this.multithreadedParquetEngineToolStripMenuItem.Checked = true;
+            }
+            catch { /* just in case */ }
         }
 
         #region Event Handlers
@@ -340,6 +377,27 @@ MULTIPLE CONDITIONS:
             System.Diagnostics.Process.Start(WikiURL);
         }
 
+        private void MainGridView_CellPainting(object sender, DataGridViewCellPaintingEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.ColumnIndex < 0)
+                return;
+
+            if (e.Value == null || e.Value == DBNull.Value)
+            {
+                e.Paint(e.CellBounds, DataGridViewPaintParts.All
+                    & ~(DataGridViewPaintParts.ContentForeground));
+
+                var font = new Font(e.CellStyle.Font, FontStyle.Italic);
+                var color = SystemColors.ActiveCaptionText;
+                if (this.mainGridView.SelectedCells.Contains(((DataGridView)sender)[e.ColumnIndex, e.RowIndex]))
+                    color = Color.White;
+
+                TextRenderer.DrawText(e.Graphics, "NULL", font, e.CellBounds, color, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+
+                e.Handled = true;
+            }
+        }
+
         #endregion
 
         private void OpenFieldSelectionDialog()
@@ -352,7 +410,7 @@ MULTIPLE CONDITIONS:
                     this.FileSchemaBackgroundWorker.RunWorkerAsync();
                 }
                 else
-                    this.FileSchemaBackgroundWorker_RunWorkerCompleted(null, new System.ComponentModel.RunWorkerCompletedEventArgs(this.openFileSchema, null, false));
+                    this.FileSchemaBackgroundWorker_RunWorkerCompleted(-1, new System.ComponentModel.RunWorkerCompletedEventArgs(this.openFileSchema, null, false));
             }
         }
 
@@ -457,7 +515,7 @@ MULTIPLE CONDITIONS:
                 e.Result = schema;
             else
             {
-                //Parquet.NET doesn't have any async methods or readers that allow sequential records reading so we need to use the ThreadPool to support cancellation.
+                //Parquet.NET doesn't have any async methods or readers that allow sequential reading so we need to use the ThreadPool to support cancellation.
                 var task = Task<ParquetReader>.Run(() =>
                 {
                     //Unfortunately there's no way to quickly get the metadata from a parquet file without reading an actual data row
@@ -500,13 +558,20 @@ MULTIPLE CONDITIONS:
                     var fields = this.openFileSchema.Fields;
                     if (fields != null && fields.Count > 0)
                     {
-                        var fieldSelectionForm = new FieldsToLoadForm(fields, UtilityMethods.GetDataTableColumns(this.MainDataSource));
-                        if (fieldSelectionForm.ShowDialog(this) == DialogResult.OK)
+                        if (AppSettings.AlwaysSelectAllFields && sender?.GetType() != typeof(int)) //We send -1 from the field selection tooltip item so we can force the field selection form to be shown
                         {
-                            if (fieldSelectionForm.NewSelectedFields != null && fieldSelectionForm.NewSelectedFields.Count > 0)
-                                this.SelectedFields = fieldSelectionForm.NewSelectedFields;
-                            else
-                                this.SelectedFields = fields.Select(f => f.Name).ToList(); //By default, show all fields
+                            this.SelectedFields = fields.Where(f => !FieldsToLoadForm.UnsupportedSchemaTypes.Contains(f.SchemaType)).Select(f => f.Name).ToList();
+                        }
+                        else
+                        {
+                            var fieldSelectionForm = new FieldsToLoadForm(fields, this.MainDataSource?.GetColumnNames() ?? new string[0]);
+                            if (fieldSelectionForm.ShowDialog(this) == DialogResult.OK)
+                            {
+                                if (fieldSelectionForm.NewSelectedFields != null && fieldSelectionForm.NewSelectedFields.Count > 0)
+                                    this.SelectedFields = fieldSelectionForm.NewSelectedFields;
+                                else
+                                    this.SelectedFields = fields.Select(f => f.Name).ToList(); //By default, show all fields
+                            }
                         }
                     }
                     else
@@ -529,27 +594,69 @@ MULTIPLE CONDITIONS:
         private void ReadDataBackgroundWorker_DoWork(object sender, DoWorkEventArgs e)
         {
             //Parquet.NET doesn't have any async methods or readers that allow sequential records reading so we need to use the ThreadPool to support cancellation.
-            var task = Task<ParquetReadResult>.Run(() =>
+            Task task = null;
+            var results = new ConcurrentDictionary<int, ParquetReadResult>();
+            var cancellationToken = new System.Threading.CancellationTokenSource();
+            if (AppSettings.ReadingEngine == ParquetEngine.Default)
             {
-                //Unfortunately there's no way to quickly get the metadata from a parquet file without reading an actual data row
-                //BUG: Parquet.NET doesn't always respect the Count parameter, sometimes returning more than the passed value...
-                using (var parquetReader = ParquetReader.OpenFromFile(this.OpenFilePath, new ParquetOptions() { TreatByteArrayAsString = true }))
+                task = Task.Run(() =>
                 {
-                    int totalRowCount = 0;
-                    DataTable result = UtilityMethods.ParquetReaderToDataTable(parquetReader, out totalRowCount, this.SelectedFields, this.CurrentOffset, this.CurrentMaxRowCount);
-                    return new ParquetReadResult(result, totalRowCount);
+                    using (var parquetReader = ParquetReader.OpenFromFile(this.OpenFilePath, new ParquetOptions() { TreatByteArrayAsString = true }))
+                    {
+                        DataTable result = UtilityMethods.ParquetReaderToDataTable(parquetReader, this.SelectedFields, this.CurrentOffset, this.CurrentMaxRowCount, cancellationToken.Token);
+                        results.TryAdd(1, new ParquetReadResult(result, parquetReader.ThriftMetadata.Num_rows));
+                    }
+                });
+            }
+            else
+            {
+                int i = 0;
+                var fieldGroups = new List<(int, List<string>)>();
+                foreach (List<string> fields in UtilityMethods.Split(this.SelectedFields, (int)(this.selectedFields.Count / Environment.ProcessorCount)))
+                {
+                    fieldGroups.Add((i++, fields));
                 }
-            });
+
+                task = ParallelAsync.ForeachAsync(fieldGroups, Environment.ProcessorCount,
+                    async fieldGroup =>
+                    {
+                        await Task.Run(() =>
+                        {
+                            using (Stream parquetStream = new FileStream(this.OpenFilePath, FileMode.Open, FileAccess.Read))
+                            using (var parquetReader = new ParquetReader(parquetStream, new ParquetOptions() { TreatByteArrayAsString = true }))
+                            {
+                                DataTable result = UtilityMethods.ParquetReaderToDataTable(parquetReader, fieldGroup.Item2, this.CurrentOffset, this.CurrentMaxRowCount, cancellationToken.Token);
+                                results.TryAdd(fieldGroup.Item1, new ParquetReadResult(result, parquetReader.ThriftMetadata.Num_rows));
+                            }
+                        });
+                    });
+            }
 
             while (!task.IsCompleted && !((BackgroundWorker)sender).CancellationPending)
             {
                 task.Wait(1000);
             }
 
-            e.Cancel = ((BackgroundWorker)sender).CancellationPending;
+            if (((BackgroundWorker)sender).CancellationPending)
+            {
+                cancellationToken.Cancel();
+                e.Cancel = true;
+            }
 
             if (task.IsCompleted)
-                e.Result = task.Result;
+            {
+                if (results.Count > 0)
+                {
+                    DataTable mergedDataTables = UtilityMethods.MergeTables(results.OrderBy(f => f.Key).Select(f => f.Value.Result).AsEnumerable());
+                    ParquetReadResult finalResult = new ParquetReadResult(mergedDataTables, results.First().Value.TotalNumberOfRecordsInFile);
+                    e.Result = finalResult;
+                }
+                else
+                {
+                    //The code should never reach here
+                    e.Result = new ParquetReadResult(new DataTable(), 0);
+                }
+            }
         }
 
         private void ReadDataBackgroundWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
@@ -586,13 +693,21 @@ MULTIPLE CONDITIONS:
         private void mainGridView_DataBindingComplete(object sender, DataGridViewBindingCompleteEventArgs e)
         {
             this.actualShownRecordCountLabel.Text = this.mainGridView.RowCount.ToString();
+
+            foreach(DataGridViewColumn column in ((DataGridView)sender).Columns)
+            {
+                if (column is DataGridViewCheckBoxColumn checkboxColumn)
+                {
+                    checkboxColumn.ThreeState = true; //handle NULLs for bools
+                }
+            }
         }
 
         private void OpenNewFile(string filePath)
         {
             this.OpenFilePath = filePath;
-            this.offsetTextBox.Text = DefaultOffset.ToString();
-            this.recordCountTextBox.Text = DefaultRowCount.ToString();
+            this.offsetTextBox.Text = string.IsNullOrWhiteSpace(this.offsetTextBox.Text) ? DefaultOffset.ToString() : this.offsetTextBox.Text;
+            this.recordCountTextBox.Text = string.IsNullOrWhiteSpace(this.recordCountTextBox.Text) ? DefaultRowCount.ToString() : this.recordCountTextBox.Text;
 
             this.OpenFieldSelectionDialog();
         }
@@ -741,5 +856,123 @@ MULTIPLE CONDITIONS:
             public FileType FileType;
         }
         #endregion
+
+        private void GetSQLCreateTableScriptToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            string tableName = DefaultTableName;
+            try
+            {
+                tableName = Path.GetFileNameWithoutExtension(this.OpenFilePath);
+            }
+            catch { /* just in case */ }
+
+            try
+            {
+                if (this.mainDataSource?.Columns.Count > 0)
+                {
+                    var dataset = new DataSet();
+
+                    this.mainDataSource.TableName = tableName;
+                    dataset.Tables.Add(this.mainDataSource);
+
+                    var scriptAdapter = new CustomScriptBasedSchemaAdapter();
+                    string sql = scriptAdapter.GetSchemaScript(dataset, false);
+
+                    Clipboard.SetText(sql);
+                    MessageBox.Show(this, "Create table script copied to clipboard!", "Parquet Viewer", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                    MessageBox.Show(this, "Please select some fields first to get the SQL script", "Parquet Viewer", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            catch (Exception ex)
+            {
+                this.ShowError(ex);
+            }
+        }
+
+        private void DefaultToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                AppSettings.UseISODateFormat = false;
+                this.defaultToolStripMenuItem.Checked = true;
+                this.iSO8601ToolStripMenuItem.Checked = false;
+                this.MainDataSource = this.MainDataSource; //Will cause a refresh of the date formats
+            }
+            catch (Exception ex)
+            {
+                this.ShowError(ex);
+            }
+        }
+
+        private void ISO8601ToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                AppSettings.UseISODateFormat = true;
+                this.defaultToolStripMenuItem.Checked = false;
+                this.iSO8601ToolStripMenuItem.Checked = true;
+                this.MainDataSource = this.MainDataSource; //Will cause a refresh of the date formats
+            }
+            catch (Exception ex)
+            {
+                this.ShowError(ex);
+            }
+        }
+
+        private void MainGridView_ColumnAdded(object sender, DataGridViewColumnEventArgs e)
+        {
+            if (e.Column is DataGridViewColumn column)
+            {
+                //This will help avoid overflowing the sum(fillweight) of the grid's columns when there are too many of them.
+                //The value of this field is not important as we do not use the FILL mode for column sizing.
+                column.FillWeight = 0.01f;
+            }
+        }
+
+        private void DefaultParquetEngineToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                AppSettings.ReadingEngine = ParquetEngine.Default;
+                this.defaultParquetEngineToolStripMenuItem.Checked = true;
+                this.multithreadedParquetEngineToolStripMenuItem.Checked = false;
+            }
+            catch (Exception ex)
+            {
+                this.ShowError(ex);
+            }
+        }
+
+        private void MultithreadedParquetEngineToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                AppSettings.ReadingEngine = ParquetEngine.Default_Multithreaded;
+                this.defaultParquetEngineToolStripMenuItem.Checked = false;
+                this.multithreadedParquetEngineToolStripMenuItem.Checked = true;
+            }
+            catch (Exception ex)
+            {
+                this.ShowError(ex);
+            }
+        }
+
+        private void MetadataViewerToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                using (Stream parquetStream = new FileStream(this.OpenFilePath, FileMode.Open, FileAccess.Read))
+                using (var parquetReader = new ParquetReader(parquetStream, new ParquetOptions() { TreatByteArrayAsString = true }))
+                using (var metadataViewer = new MetadataViewer(parquetReader))
+                {
+                    metadataViewer.ShowDialog(this);
+                }
+            }
+            catch(Exception ex)
+            {
+                this.ShowError(ex);
+            }
+        }
     }
 }
